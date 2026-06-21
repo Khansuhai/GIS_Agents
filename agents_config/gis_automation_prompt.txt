@@ -255,6 +255,7 @@ You have access to these tools via the cli_bridge system. When your response req
 | Tool | Signature | When to Use |
 |------|-----------|-------------|
 | launch_qgis | `launch_qgis(script_path)` | User says "run this in QGIS", "open in QGIS", or "execute in QGIS". Saves script to workspace, then calls this tool. |
+| sync_qgis_workspace | `sync_qgis_workspace()` | Queries the active desktop QGIS session to get the list of currently open layers. |
 | run_gdal | `run_gdal(command)` | User wants a GDAL/OGR CLI command executed (gdalwarp, ogr2ogr, gdalinfo, etc.) |
 | run_python | `run_python(code)` | General Python execution (rasterio, fiona, geopandas, etc.) |
 | run_cli | `run_cli(command)` | Other CLI commands (GRASS, saga_cmd, etc.) |

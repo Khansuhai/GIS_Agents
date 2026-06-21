@@ -10,21 +10,26 @@ This system provides a beautiful, real-time web UI that coordinates several spec
 
 ```mermaid
 graph TD
-    User([User Web GUI]) <--> GUI[Streamlit UI]
+    User([User Web GUI]) <--> GUI[Streamlit UI - gui.py]
     
     subgraph Core System
-        GUI <--> Orchestrator{Agent Orchestrator}
+        GUI <--> Orchestrator{Agent Orchestrator - orchestrator.py}
         Orchestrator <--> Agents[Agent Prompts: Glaciology, SAR, Automation, etc.]
         Orchestrator <--> Ollama(Local LLM: qwen2.5-coder)
-        GUI <--> VE[Voice Engine: TTS/STT]
     end
     
     subgraph Execution Sandbox
-        GUI -- Request Permission --> User
-        GUI -- Execute --> Bridge[CLI Bridge: cli_bridge.py]
+        GUI -- Allow/Deny Button click --> Gate[Web Permission Gate]
+        Gate <--> JSONLock[pending_permission.json Lock]
+        Bridge[CLI Bridge - cli_bridge.py] <--> JSONLock
         Bridge --> Sandbox[D:\GIS_Agents\workspace\]
         Bridge --> Audit[(audit.jsonl)]
         Bridge --> LiveLog[(session.log)]
+    end
+
+    subgraph External Integrations
+        Bridge <-->|TCP Port 5005 RPC| QGIS[Active QGIS Session - qgis_live_server.py]
+        Bridge <-->|win32com API| HECRAS[HEC-RAS Software Engine]
     end
 
     GUI -. View Logs .-> LiveLog
@@ -32,9 +37,48 @@ graph TD
 
 The system is split into three main layers:
 
-1. **User Interface (`gui.py`)**: A modern, feature-rich Streamlit web application providing agent chat, real-time terminal progress streaming, a local download folder status manager, and a text-to-speech/speech-to-text engine.
-2. **Orchestration (`core/orchestrator.py`)**: An intelligent routing router that matches the user's natural language queries (using regex + LLM matching) and directs them to the optimal expert agent.
-3. **Execution Sandbox (`core/cli_bridge.py`)**: A hardened gatekeeper. It is the **only** module that interacts with the operating system. It executes code and CLI commands inside a sandbox folder, audits all operations in `audit.jsonl`, and prints commands to a console permission prompt before execution.
+1. **User Interface ([gui.py](file:///d:/GIS_Agents/gui.py))**: A modern, feature-rich Streamlit web application providing agent chat, real-time terminal progress streaming, a local download folder status manager, interactive map previews, and an Area of Interest (AOI) uploader.
+2. **Orchestration ([core/orchestrator.py](file:///d:/GIS_Agents/core/orchestrator.py))**: An intelligent routing manager that matches the user's natural language queries (using regex + LLM matching) and directs them to the optimal expert agent.
+3. **Execution Sandbox ([core/cli_bridge.py](file:///d:/GIS_Agents/core/cli_bridge.py))**: A hardened gatekeeper. It is the **only** module that interacts with the operating system. It executes code and CLI commands inside a sandbox folder, audits all operations in `audit.jsonl`, and gates all executing commands via a non-blocking Web Permission Gate.
+
+---
+
+## 🚀 Key Implemented Features
+
+### 1. 🔑 Web-Based Permission Gate
+* **The Problem**: Traditional console-based inputs (`input("Allow? [y/n]")`) block execution threads, causing Streamlit web interfaces to freeze or hang indefinitely without user visibility.
+* **The Solution**: Implemented a non-blocking file-based handshake. When a dangerous action (e.g. running Python, executing a shell command, downloading a file) is requested:
+  1. The CLI bridge writes the request metadata to [workspace/temp/pending_permission.json](file:///d:/GIS_Agents/workspace/temp/pending_permission.json) and polls it in short sleep loops.
+  2. The Streamlit UI displays a warning banner showing the action details alongside **Approve** and **Deny** buttons.
+  3. Clicking Approve updates the JSON file status to `"allowed"`, which unblocks the CLI bridge and resumes execution instantly. 
+
+### 2. 🖥️ QGIS "Live Link" RPC Console
+* **The Problem**: Opening a new QGIS desktop window for every single Python script run is slow, resource-heavy, and loses active layer selections or project state.
+* **The Solution**: Created [qgis_live_server.py](file:///d:/GIS_Agents/qgis_live_server.py), a local TCP RPC server running on Port `5005`.
+  * When copy-pasted into the active QGIS Python Console, it spawns a daemon listening thread.
+  * When the `GIS Automation Expert` writes PyQGIS code, `cli_bridge.py` sends the code payload directly over TCP.
+  * QGIS executes the code in the context of the open desktop session, rendering layers, shapefiles, and raster stylings live on screen.
+  * A sidebar QGIS active layer list continuously queries the active QGIS project, synchronizing layers and attributes, and automatically injecting them into the agent's LLM system prompt.
+
+### 3. 🗺️ Interactive Web GIS Map Previews
+* **The Solution**: Embedded `folium` and `streamlit-folium` directly into the Streamlit chat bubbles. 
+  * The system dynamically parses agent and user messages for workspace paths ending in spatial formats (`.geojson`, `.shp`, `.gpkg`, `.kml`, `.tif`, `.tiff`).
+  * If found, the application reads the vector geometries (reprojecting to WGS84 EPSG:4326 via Geopandas) or extracts raster boundaries (via Rasterio) and displays an interactive, slippy map directly inside the message history.
+
+### 4. 📂 Area of Interest (AOI) Spatial Uploader
+* **The Solution**: A sidebar drag-and-drop file uploader supporting GeoJSON, KML, and zipped Shapefiles.
+  * Zipped Shapefiles are automatically unpacked to a dedicated sub-folder.
+  * Once uploaded, the file path is pinned to the session state, rendering the AOI boundary on a compact sidebar map.
+  * An automated system notification is appended to the active agent conversation:
+    > *[SYSTEM NOTIFICATION] User uploaded a new Spatial AOI file at workspace/... Please read this file using geopandas to get coordinates.*
+
+### 5. 🌊 GLOF & Dam Breach Simulator Dashboard
+* **Empirical Parameter Calculator**: Dynamically calculates breach parameters (average breach width $B_{avg}$, formation time $t_f$, and peak outflow $Q_p$) using classic moraine/dam breach equations:
+  - **Froehlich (2008)**
+  - **MacDonald & Langridge-Monopolis (1984)**
+  - **Von Thun & Gillette (1990)**
+* **HEC-RAS COM Automation**: Runs unsteady-flow computations in the background using `win32com.client` class dispatches (e.g., `RAS631.HECRASController`), returning simulation outputs directly to the UI.
+* **GDAL DEM Product Generator**: A GUI interface to process raw elevation TIFFs and automatically output Slope maps, Aspect maps, Hillshades, and vector Contour line shapefiles.
 
 ---
 
@@ -57,9 +101,9 @@ Each agent has a customized prompt configuration located in `agents_config/` tai
 
 The swarm is designed with a **safety-first** philosophy for local code execution:
 * **The Sandbox**: All file modifications and scripting operations are anchored inside `D:\GIS_Agents\workspace\`. The `cli_bridge.py` rejects any path traversal attempt (e.g., `..`) that escapes this folder.
-* **Permission Prompts**: Before dangerous operations (writing files, running Python, or running CLI tools) are performed, the CLI bridge blocks and waits for a console confirmation.
+* **Permission Prompts**: Before dangerous operations (writing files, running Python, or running CLI tools) are performed, the CLI bridge blocks and waits for a confirmation.
 * **Security Gate**: The Streamlit interface is protected by a password input wall at startup to ensure public Cloudflare tunnels do not expose your system to unauthorized users.
-* **Blacklists**: Any commands containing blacklisted patterns (like `rm -rf`, `format`, `os.system`) are blocked automatically.
+* **Blacklists**: Any commands containing blacklisted patterns (like `rm -rf`, `format`, `os.system`, etc.) are blocked automatically.
 
 ---
 
@@ -73,24 +117,33 @@ The swarm is designed with a **safety-first** philosophy for local code executio
    ollama pull qwen2.5-coder:7b
    ```
 3. **External Dependencies** (Optional but highly recommended):
-   - QGIS 3.x (to run PyQGIS automation scripts)
-   - HEC-RAS (to execute river modeling plans)
+   - **QGIS 3.x** (to run PyQGIS automation scripts)
+   - **HEC-RAS** (to execute river modeling plans)
 
 ### ⚙️ Installation
 
 1. Clone this repository (or copy the files) to `D:\GIS_Agents\`.
 2. Install the Python dependencies:
    ```bash
-   pip install streamlit requests pyttsx3 SpeechRecognition earthengine-api geemap sentinelsat osmnx elevation cdsapi xarray rioxarray dask
+   pip install streamlit requests pyttsx3 SpeechRecognition earthengine-api geemap sentinelsat osmnx elevation cdsapi xarray rioxarray dask pywin32 streamlit-folium geopandas rasterio pyproj pystac-client planetary-computer fiona
    ```
 
 ### 💻 Running the App
 
-To run the Streamlit GUI locally:
-```bash
-python launch_gui.py
-```
-This starts the Streamlit server at `http://localhost:8501`.
+1. **Start the Streamlit GUI locally**:
+   ```bash
+   python launch_gui.py
+   ```
+   This starts the Streamlit server at `http://localhost:8501`.
+
+2. **Activate the QGIS Live Link Bridge**:
+   - Open your desktop QGIS window.
+   - Go to `Plugins -> Python Console`.
+   - Open the file [qgis_live_server.py](file:///d:/GIS_Agents/qgis_live_server.py) or copy its contents and run it inside the console.
+   - The console will display: `[QGIS LIVE LINK ACTIVE]`. The port `5005` will now be listening for PyQGIS script payloads.
+
+3. **Verify HEC-RAS COM API Registration**:
+   - Ensure HEC-RAS is installed. The script will automatically attempt to dispatch the HEC-RAS Controller COM class corresponding to your version (e.g., `RAS631.HECRASController` for version 6.3.1).
 
 ### 🌐 Exposing the GUI Publicly (Cloudflare Tunnel)
 
@@ -105,27 +158,9 @@ To access your GIS workspace and control your agents from another device (like a
 
 ---
 
-## 🛠️ Configuration & Customization
+## 🔮 Future Plans & Recommendations
 
-### Security Password
-To change the access password:
-1. Open `gui.py`.
-2. Locate the **Security Gate** section:
-   ```python
-   if password == "himalaya":  # Change "himalaya" to your secret password
-   ```
-
-### Adding New Tools
-To add new features or external command integrations to the CLI bridge:
-1. Open `core/cli_bridge.py`.
-2. Implement your tool wrapper function.
-3. Expose it to the LLM by adding it to the `TOOLS` mapping dict at the bottom of the file.
-
----
-
-## 🔮 Future Recommendations
-
-1. **Database Chat Persistence**: Currently, chat histories reside in Streamlit's session state. Adding a lightweight SQLite backend will allow users to review past agent conversations across browser sessions.
-2. **Web-Based Permission Console**: Move the `y/n` prompt from the terminal shell directly into the Streamlit UI to avoid having to check the host console to approve script executions.
-3. **Multi-User Isolation**: Implement individual sandbox workspaces per user token to support collaborative GIS work without file-overwrite collisions.
-4. **Enhanced Voice Control**: Improve voice integration to support speech-to-text directly via WebRTC in the browser, rather than using the host machine's local microphone (which only works when hosting locally).
+1. **SQLite Database Chat Persistence**: Currently, chat histories reside in Streamlit's session state and disappear upon browser refresh. Migrating chat logs to a lightweight SQLite database will allow users to review past agent conversations and audit commands across browser sessions.
+2. **Browser-Based Audio (WebRTC STT)**: Replace the Python local microphone library with a browser-native audio recorder component. This allows field teams accessing the tool via Cloudflare tunnel on their mobile devices to interact via voice.
+3. **GLOF Downstream Vulnerability & Impact Assessor**: Automate the impact assessment phase by scripting a zonal overlay tool. When HEC-RAS computes an inundation depth raster, the agent will intersect the flood boundaries with OpenStreetMap building footprints (extracted via `osmnx`), classifying buildings into CWC Risk categories (Low, Medium, High, Extreme) and outputting a structured PDF disaster report.
+4. **Auto-Styling Cartography Engine**: Develop custom styling scripts in PyQGIS that automatically apply standard CWC/NDMA layer styling, classification colors, and contour layouts to vector outputs synced via the Live Link.

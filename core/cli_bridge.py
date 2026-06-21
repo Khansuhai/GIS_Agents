@@ -75,7 +75,10 @@ def _sanitize_path(path: str) -> Path:
 
 
 def _ask_permission(action: str, details: str) -> bool:
-    """Print a permission prompt and wait for y/n."""
+    """Print a permission prompt and wait for y/n, or use file lock in Streamlit mode."""
+    import os
+    import time
+    
     print()
     print("=" * 60)
     print("  [PERMISSION] AGENT REQUESTS PERMISSION")
@@ -83,6 +86,55 @@ def _ask_permission(action: str, details: str) -> bool:
     print(f"  Action : {action}")
     print(f"  Details: {details}")
     print("=" * 60)
+    
+    if os.environ.get("GIS_AGENT_MODE") == "streamlit":
+        if os.environ.get("GIS_AGENT_GUI_APPROVED") == "True":
+            print("  [AUTO-ALLOWED] Approved via Streamlit GUI.")
+            print("=" * 60)
+            _log_session(f"[PERMISSION] Auto-allowed: {action}")
+            return True
+            
+        auth_file = Path(r"D:\GIS_Agents\workspace\temp\pending_permission.json")
+        auth_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        req_data = {
+            "action": action,
+            "details": details,
+            "status": "pending",
+            "timestamp": time.time()
+        }
+        
+        try:
+            auth_file.write_text(json.dumps(req_data, indent=2), encoding="utf-8")
+            _log_session(f"[PERMISSION] Web permission request created for {action}")
+        except Exception as e:
+            _log_session(f"[ERROR] Failed to write permission file: {e}")
+            return False
+            
+        start_time = time.time()
+        timeout = 180  # 3 minutes
+        while time.time() - start_time < timeout:
+            time.sleep(0.5)
+            if not auth_file.exists():
+                _log_session(f"[PERMISSION] Permission file deleted. Denied.")
+                return False
+            try:
+                current = json.loads(auth_file.read_text(encoding="utf-8"))
+                if current.get("status") == "allowed":
+                    auth_file.unlink(missing_ok=True)
+                    _log_session(f"[PERMISSION] Web permission APPROVED for {action}")
+                    return True
+                elif current.get("status") == "denied":
+                    auth_file.unlink(missing_ok=True)
+                    _log_session(f"[PERMISSION] Web permission DENIED for {action}")
+                    return False
+            except Exception:
+                pass
+                
+        auth_file.unlink(missing_ok=True)
+        _log_session(f"[PERMISSION] Web permission TIMEOUT for {action}")
+        return False
+        
     try:
         answer = input("  Allow? [y/n]: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
@@ -420,7 +472,7 @@ def run_cli(command: str) -> str:
 # -- Software Launchers -------------------------------------------------------
 
 def launch_qgis(script_path: str) -> str:
-    """Launch QGIS with a pre-loaded Python script. DANGEROUS -- asks user y/n first."""
+    """Launch QGIS with a pre-loaded Python script or run it live if server is active. DANGEROUS -- asks user y/n first."""
     try:
         safe = _sanitize_path(script_path)
         if not safe.is_file():
@@ -435,6 +487,40 @@ def launch_qgis(script_path: str) -> str:
         if not _ask_permission("LAUNCH QGIS", f"qgis --code {safe}"):
             _log("launch_qgis", str(safe), "DENIED_BY_USER")
             return "Permission denied by user."
+
+        # Attempt to run via Live RPC server
+        import socket
+        import json
+        
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1.5)  # fast check
+            s.connect(('127.0.0.1', 5005))
+            
+            code_to_send = safe.read_text(encoding="utf-8")
+            _log_session(f"[QGIS LIVE] Sending script to active QGIS session...")
+            s.sendall(code_to_send.encode('utf-8'))
+            s.shutdown(socket.SHUT_WR)
+            
+            s.settimeout(60.0)  # script execution timeout
+            resp_bytes = []
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                resp_bytes.append(chunk)
+            s.close()
+            
+            resp = json.loads(b"".join(resp_bytes).decode('utf-8'))
+            status = "SUCCESS" if resp.get("success") else "FAILED"
+            _log_session(f"[QGIS LIVE] Script finished with status: {status}")
+            _log("launch_qgis_live", str(safe), status)
+            
+            return f"**QGIS Live Link Executed** ({status})\n\n```\n{resp.get('output')}\n```"
+            
+        except (socket.timeout, ConnectionRefusedError, ConnectionResetError):
+            # Server not running, fallback to launching fresh process
+            _log_session("[QGIS] Live link not active. Launching a new QGIS window...")
 
         # Try common QGIS install locations on Windows
         qgis_candidates = [
@@ -652,6 +738,107 @@ def run_python_script(script_path: str) -> str:
         return str(e)
 
 
+def run_hecras_simulation(project_path: str) -> str:
+    """Open HEC-RAS, compute current project plan, and close it using COM API."""
+    try:
+        safe = _sanitize_path(project_path)
+        if not safe.is_file():
+            return f"Project not found: {safe}"
+            
+        if not _ask_permission("HEC-RAS COM RUN", str(safe)):
+            return "Permission denied by user."
+            
+        _log_session(f"[HEC-RAS COM] Connecting to HEC-RAS COM interface...")
+        
+        import win32com.client
+        
+        hec_classes = [
+            "RAS631.HECRASController",
+            "RAS620.HECRASController",
+            "RAS610.HECRASController",
+            "RAS601.HECRASController",
+            "RAS507.HECRASController",
+            "RAS.HECRASController"
+        ]
+        hec = None
+        for cls in hec_classes:
+            try:
+                hec = win32com.client.Dispatch(cls)
+                _log_session(f"[HEC-RAS COM] Instantiated class: {cls}")
+                break
+            except Exception:
+                pass
+                
+        if not hec:
+            return "Error: Could not instantiate HEC-RAS COM Controller. Ensure HEC-RAS is installed on this PC."
+            
+        _log_session(f"[HEC-RAS COM] Opening project: {safe.name}")
+        hec.Project_Open(str(safe))
+        
+        current_plan = hec.CurrentPlanFile()
+        _log_session(f"[HEC-RAS COM] Plan: {current_plan}")
+        
+        _log_session("[HEC-RAS COM] Starting computations (blocking thread)...")
+        t0 = time.time()
+        success, nmsg, msg = hec.Compute_CurrentPlan(0, None, True)
+        duration = time.time() - t0
+        
+        _log_session(f"[HEC-RAS COM] Finished in {duration:.1f} seconds. Result={success}")
+        
+        hec.Project_Close()
+        
+        return f"**HEC-RAS Simulation Complete**\n- Plan File: {current_plan}\n- Success Status: {success}\n- Compute Duration: {duration:.1f}s\n- Output Messages:\n```\n{msg}\n```"
+        
+    except Exception as e:
+        _log_session(f"[HEC-RAS COM ERROR] {e}")
+        return f"Error executing HEC-RAS simulation: {e}"
+
+
+def sync_qgis_workspace() -> str:
+    """Connect to active QGIS session over port 5005, inspect active project layers, and return layer list in JSON."""
+    import socket
+    import json
+    
+    code = """
+import json
+layers = []
+for layer in QgsProject.instance().mapLayers().values():
+    layers.append({
+        "name": layer.name(),
+        "type": layer.type().name,
+        "source": layer.source(),
+        "crs": layer.crs().authid(),
+        "valid": layer.isValid()
+    })
+print(json.dumps(layers))
+"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1.5)
+        s.connect(('127.0.0.1', 5005))
+        s.sendall(code.encode('utf-8'))
+        s.shutdown(socket.SHUT_WR)
+        
+        s.settimeout(5.0)
+        resp_bytes = []
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            resp_bytes.append(chunk)
+        s.close()
+        
+        resp = json.loads(b"".join(resp_bytes).decode('utf-8'))
+        if resp.get("success"):
+            raw_out = resp.get("output", "[]").strip()
+            lines = [l.strip() for l in raw_out.splitlines() if l.strip()]
+            if lines:
+                return lines[-1]
+        return "[]"
+    except Exception as e:
+        return f"Error: QGIS Live Link not active ({e})"
+
+
 # -- Tool Registry ------------------------------------------------------------
 
 TOOLS = {
@@ -672,6 +859,8 @@ TOOLS = {
     "download_dem": download_dem,
     "download_weather": download_weather,
     "run_python_script": run_python_script,
+    "run_hecras_simulation": run_hecras_simulation,
+    "sync_qgis_workspace": sync_qgis_workspace,
 }
 
 

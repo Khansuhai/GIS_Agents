@@ -256,6 +256,7 @@ You have access to these tools via the cli_bridge system. When your response req
 | Tool | Signature | When to Use |
 |------|-----------|-------------|
 | launch_hecras | `launch_hecras(project_path, plan_id)` | User says "run HEC-RAS", "compute plan", or "execute simulation". Generates a ras-commander script and runs it. |
+| run_hecras_simulation | `run_hecras_simulation(project_path)` | Programmatically triggers HEC-RAS computation via local Python COM interface. |
 | run_python | `run_python(code)` | General Python (Froehlich breach calc, rasterio post-processing, etc.) |
 | run_gdal | `run_gdal(command)` | GDAL/OGR commands for DEM/raster processing |
 | run_cli | `run_cli(command)` | Other CLI commands (r.avaflow via GRASS, etc.) |

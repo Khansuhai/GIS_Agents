@@ -1,12 +1,14 @@
 import streamlit as st
 import json
-import os
 import sys
+import os
 import subprocess
 import time
 from pathlib import Path
 from datetime import datetime
 import re
+
+os.environ["GIS_AGENT_MODE"] = "streamlit"
 
 SESSION_LOG = Path(r"D:\GIS_Agents\logs\session.log")
 
@@ -117,7 +119,7 @@ AGENTS = {
 
 try:
     from core.orchestrator import load_agent_prompt, OLLAMA_URL, _safe_text
-    from core.cli_bridge import execute_tool, TOOLS, BASE_DIR, run_python, launch_qgis
+    from core.cli_bridge import execute_tool, TOOLS, BASE_DIR, run_python, launch_qgis, sync_qgis_workspace
     from core.voice_engine import speak, listen
     import requests
 except ImportError as e:
@@ -125,12 +127,112 @@ except ImportError as e:
     st.info("Make sure you are running from D:\\GIS_Agents")
     st.stop()
 
+def check_qgis_live():
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(('127.0.0.1', 5005))
+        s.close()
+        return True
+    except Exception:
+        return False
+
 def check_ollama():
     try:
         r = requests.get(OLLAMA_URL, timeout=2)
         return r.status_code == 200
     except Exception:
         return False
+
+
+def render_interactive_map(content: str):
+    """Scan content for geospatial file paths in the workspace and render an interactive map if found."""
+    import re
+    # Match workspace downloads or temp paths
+    paths = []
+    for ext in ['.geojson', '.shp', '.gpkg', '.kml', '.tif', '.tiff']:
+        matches = re.findall(rf'[\w\:\\\-\.\/]+\{ext}', content, re.IGNORECASE)
+        for m in matches:
+            try:
+                candidate = Path(m.strip("'\"` "))
+                if not candidate.is_absolute():
+                    candidate = (BASE_DIR / candidate).resolve()
+                else:
+                    candidate = candidate.resolve()
+                if candidate.exists() and candidate.is_file() and str(candidate).startswith(str(BASE_DIR)):
+                    if candidate not in paths:
+                        paths.append(candidate)
+            except Exception:
+                pass
+                
+    if not paths:
+        return
+        
+    try:
+        import folium
+        from streamlit_folium import st_folium
+    except ImportError:
+        st.warning("⚠️ Map preview disabled: Install folium and streamlit-folium to view maps.")
+        return
+        
+    for path in paths:
+        try:
+            st.info(f"🗺️ **Interactive Preview:** `{path.name}`")
+            ext = path.suffix.lower()
+            
+            # Default map center (Himalayas)
+            m = folium.Map(location=[34.1526, 77.5771], zoom_start=8)
+            
+            if ext in ['.geojson', '.shp', '.gpkg', '.kml']:
+                try:
+                    import geopandas as gpd
+                    gdf = gpd.read_file(str(path))
+                    if gdf.crs is not None and gdf.crs != "EPSG:4326":
+                        gdf = gdf.to_crs(epsg=4326)
+                    
+                    if not gdf.empty:
+                        centroid = gdf.unary_union.centroid
+                        m = folium.Map(location=[centroid.y, centroid.x], zoom_start=11)
+                        # Add GeoJSON layer to map
+                        folium.GeoJson(gdf.to_json(), name=path.name).add_to(m)
+                except ImportError:
+                    st.warning("Install geopandas and fiona to preview vector layers.")
+                    continue
+                
+            elif ext in ['.tif', '.tiff']:
+                try:
+                    import rasterio
+                    from pyproj import Transformer
+                    with rasterio.open(str(path)) as src:
+                        bounds = src.bounds
+                        crs = src.crs
+                        transformer = Transformer.from_crs(crs, "EPSG:4326", always_axis_order=True)
+                        lon_min, lat_min = transformer.transform(bounds.left, bounds.bottom)
+                        lon_max, lat_max = transformer.transform(bounds.right, bounds.top)
+                        
+                        m = folium.Map(location=[(lat_min + lat_max)/2, (lon_min + lon_max)/2], zoom_start=10)
+                        # Draw bounding box
+                        folium.Rectangle(
+                            bounds=[[lat_min, lon_min], [lat_max, lon_max]],
+                            color='#ff7800',
+                            fill=True,
+                            fill_color='#ff7800',
+                            fill_opacity=0.2,
+                            popup=f"Raster bounds: {path.name}"
+                        ).add_to(m)
+                        st.caption(f"**Raster Info:** {src.width}x{src.height} | Bands: {src.count} | CRS: {crs}")
+                except ImportError:
+                    st.warning("Install rasterio and pyproj to preview raster bounds.")
+                    continue
+            
+            # Draw Streamlit Folium map with unique key based on path and size
+            map_key = f"map_{path.name}_{path.stat().st_size}"
+            st_folium(m, width=700, height=400, key=map_key)
+            
+        except Exception as e:
+            st.error(f"Error rendering map preview for {path.name}: {e}")
+
 
 # Session State
 if "selected_agent" not in st.session_state:
@@ -217,11 +319,122 @@ with st.sidebar:
 
     downloads_panel()
 
+    # 🗺️ AOI Uploader Panel
+    def aoi_uploader():
+        with st.expander("🗺️ Area of Interest (AOI) Uploader", expanded=True):
+            uploaded_file = st.file_uploader(
+                "Upload GeoJSON, KML, or Zipped Shapefile", 
+                type=["geojson", "kml", "zip"], 
+                key="aoi_file_uploader"
+            )
+            
+            if uploaded_file is not None:
+                # To prevent re-running processing on every refresh, track the uploaded name
+                if st.session_state.get("last_uploaded_aoi") != uploaded_file.name:
+                    downloads_dir = BASE_DIR / "downloads"
+                    downloads_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    save_path = downloads_dir / uploaded_file.name
+                    with open(save_path, "wb") as f:
+                        f.write(uploaded_file.getbuffer())
+                    
+                    final_path = save_path
+                    # Handle zip (shapefile bundle)
+                    if uploaded_file.name.lower().endswith(".zip"):
+                        import zipfile
+                        unzip_dir = downloads_dir / save_path.stem
+                        unzip_dir.mkdir(parents=True, exist_ok=True)
+                        try:
+                            with zipfile.ZipFile(save_path, 'r') as zip_ref:
+                                zip_ref.extractall(unzip_dir)
+                            # Find .shp file
+                            shp_files = list(unzip_dir.glob("**/*.shp"))
+                            if shp_files:
+                                final_path = shp_files[0]
+                                st.success(f"Shapefile extracted: {final_path.name}")
+                            else:
+                                st.error("No .shp file found inside the zip!")
+                                final_path = None
+                        except Exception as e:
+                            st.error(f"Failed to unzip: {e}")
+                            final_path = None
+                    else:
+                        st.success(f"File uploaded: {uploaded_file.name}")
+                    
+                    if final_path:
+                        rel_path = final_path.relative_to(BASE_DIR)
+                        st.session_state["active_aoi_path"] = str(rel_path)
+                        st.session_state["last_uploaded_aoi"] = uploaded_file.name
+                        
+                        # Notify the agent about the uploaded file in chat history
+                        sys_notification = (
+                            f"[SYSTEM NOTIFICATION] User uploaded a new Spatial AOI (boundary) file "
+                            f"at `workspace/{rel_path.as_posix()}`. "
+                            f"For any geospatial data download (GEE, Sentinel, weather) or clipping requests, "
+                            f"please reference and read this file using geopandas to get the coordinates/geometry. "
+                            f"Do NOT ask the user where the file is."
+                        )
+                        st.session_state["chat_history"][st.session_state["selected_agent"]].append({
+                            "role": "user",
+                            "content": sys_notification,
+                            "timestamp": datetime.now().strftime("%H:%M:%S")
+                        })
+                        st.rerun()
+            
+            # If an AOI path exists, render it on a sidebar map!
+            active_aoi = st.session_state.get("active_aoi_path")
+            if active_aoi:
+                full_aoi_path = BASE_DIR / active_aoi
+                st.write(f"**Active AOI:** `{active_aoi}`")
+                
+                try:
+                    import folium
+                    from streamlit_folium import st_folium
+                    import geopandas as gpd
+                    
+                    gdf = gpd.read_file(str(full_aoi_path))
+                    if gdf.crs is not None and gdf.crs != "EPSG:4326":
+                        gdf = gdf.to_crs(epsg=4326)
+                        
+                    if not gdf.empty:
+                        centroid = gdf.unary_union.centroid
+                        m = folium.Map(location=[centroid.y, centroid.x], zoom_start=11)
+                        folium.GeoJson(gdf.to_json(), name="AOI").add_to(m)
+                        
+                        # sidebar width is small, make map compact
+                        st_folium(m, width=280, height=200, key="sidebar_aoi_map")
+                except Exception as e:
+                    st.caption(f"Could not load map: {e}")
+                
+                if st.button("❌ Clear Active AOI"):
+                    st.session_state["active_aoi_path"] = None
+                    st.session_state["last_uploaded_aoi"] = None
+                    st.rerun()
+                    
+    aoi_uploader()
+
     st.divider()
     ollama_ok = check_ollama()
     st.markdown(f"{'🟢 Connected' if ollama_ok else '🔴 Disconnected'} to Ollama")
     st.markdown(f"**Model:** qwen2.5-coder")
     
+    qgis_ok = check_qgis_live()
+    st.markdown(f"{'🟢 Connected' if qgis_ok else '🔴 Disconnected'} to QGIS Live Link")
+    
+    # QGIS Active Layers Panel
+    st.session_state["qgis_layers"] = None
+    if qgis_ok:
+        try:
+            layers_json = sync_qgis_workspace()
+            layers = json.loads(layers_json)
+            if layers:
+                st.session_state["qgis_layers"] = layers
+                with st.expander("🖥️ QGIS Active Layers", expanded=True):
+                    for lyr in layers:
+                        st.caption(f"- **{lyr['name']}** ({lyr['type'].lower()})")
+        except Exception:
+            pass
+
     try:
         file_count = sum([len(files) for r, d, files in os.walk(str(BASE_DIR))])
         st.markdown(f"📁 {file_count} files in workspace")
@@ -254,9 +467,37 @@ with st.sidebar:
 current_agent_key = st.session_state["selected_agent"]
 agent_info = AGENTS[current_agent_key]
 
-st.title(f"💬 Chat with {agent_info['name']}")
+# --- MAIN AREA TABS ---
+tab1, tab2 = st.tabs(["💬 Multi-Agent Chat", "🌊 GLOF & Dam Breach Simulator"])
+
+with tab1:
+    st.title(f"💬 Chat with {agent_info['name']}")
 st.caption(f"Role: {agent_info['role']}")
 st.info("Switching agents starts a new conversation.")
+
+# --- PENDING PERMISSION WEB GATE ---
+permission_file = Path(r"D:\GIS_Agents\workspace\temp\pending_permission.json")
+if permission_file.exists():
+    try:
+        req = json.loads(permission_file.read_text(encoding="utf-8"))
+        if req.get("status") == "pending":
+            st.warning(f"⚠️ **Security Alert**: Sandbox requires authorization for action: **{req['action']}**")
+            st.code(req["details"])
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("✅ Approve Action", key="web_auth_approve"):
+                    req["status"] = "allowed"
+                    permission_file.write_text(json.dumps(req), encoding="utf-8")
+                    st.success("Approved! Resuming execution...")
+                    st.rerun()
+            with col2:
+                if st.button("❌ Deny Action", key="web_auth_deny"):
+                    req["status"] = "denied"
+                    permission_file.write_text(json.dumps(req), encoding="utf-8")
+                    st.error("Denied! Cancelling execution...")
+                    st.rerun()
+    except Exception:
+        pass
 
 if not ollama_ok:
     st.error("⚠️ Ollama is not running. Start it first on http://localhost:11434")
@@ -270,6 +511,7 @@ for idx, msg in enumerate(history):
     if msg["role"] == "user":
         with st.chat_message("user", avatar="👤"):
             st.markdown(msg["content"])
+            render_interactive_map(msg["content"])
     else:
         a_info = AGENTS[msg["agent_key"]]
         with st.chat_message("agent", avatar=a_info["icon"]):
@@ -297,8 +539,12 @@ for idx, msg in enumerate(history):
                             if st.button("✅ Allow Execution", key=f"allow_{idx}"):
                                 st.session_state[exec_key] = "allow"
                                 t0 = time.time()
-                                with st.spinner(f"⏳ Agent is working on {tool_name}..."):
-                                    result = execute_tool(tool_name, **args)
+                                os.environ["GIS_AGENT_GUI_APPROVED"] = "True"
+                                try:
+                                    with st.spinner(f"⏳ Agent is working on {tool_name}..."):
+                                        result = execute_tool(tool_name, **args)
+                                finally:
+                                    os.environ["GIS_AGENT_GUI_APPROVED"] = "False"
                                 duration = time.time() - t0
                                 st.success(f"✅ Completed in {duration:.1f} seconds")
                                 st.session_state["chat_history"][current_agent_key].append({
@@ -327,6 +573,7 @@ for idx, msg in enumerate(history):
                     st.error(f"Failed to parse tool call: {e}")
                     
             st.markdown(display_content)
+            render_interactive_map(display_content)
             
             # Action buttons for python code blocks
             py_matches = python_pattern.findall(content)
@@ -335,18 +582,26 @@ for idx, msg in enumerate(history):
                     col1, col2 = st.columns([1, 1])
                     if "qgis" in code.lower():
                         with col1:
-                            if st.button("▶️ Run in QGIS", key=f"qgis_{idx}_{p_idx}"):
+                             if st.button("▶️ Run in QGIS", key=f"qgis_{idx}_{p_idx}"):
                                 # Save code to a temp file and launch qgis
                                 tmp_script = BASE_DIR / "temp" / f"qgis_script_{idx}_{p_idx}.py"
                                 tmp_script.parent.mkdir(exist_ok=True)
                                 tmp_script.write_text(code, encoding='utf-8')
-                                res = launch_qgis(str(tmp_script))
+                                os.environ["GIS_AGENT_GUI_APPROVED"] = "True"
+                                try:
+                                    res = launch_qgis(str(tmp_script))
+                                finally:
+                                    os.environ["GIS_AGENT_GUI_APPROVED"] = "False"
                                 st.info(res)
                     with col2:
                         if st.button("▶️ Run as Script", key=f"run_script_{idx}_{p_idx}"):
                             t0 = time.time()
-                            with st.spinner("⏳ Agent is working on Python Script..."):
-                                res = run_python(code)
+                            os.environ["GIS_AGENT_GUI_APPROVED"] = "True"
+                            try:
+                                with st.spinner("⏳ Agent is working on Python Script..."):
+                                    res = run_python(code)
+                            finally:
+                                os.environ["GIS_AGENT_GUI_APPROVED"] = "False"
                             duration = time.time() - t0
                             st.success(f"✅ Completed in {duration:.1f} seconds")
                             st.text_area("Output", res, height=200)
@@ -374,6 +629,13 @@ if user_input:
         with st.spinner("Thinking..."):
             try:
                 sys_prompt = load_agent_prompt(current_agent_key)
+                
+                # Dynamic QGIS layer context injection
+                qgis_layers = st.session_state.get("qgis_layers")
+                if qgis_layers:
+                    layers_str = "\n".join([f"- {l['name']} ({l['type'].lower()}) [Source: {l['source']}, CRS: {l['crs']}]" for l in qgis_layers])
+                    sys_prompt += f"\n\n[SYSTEM CONTEXT] Currently active layers open in the user's desktop QGIS session:\n{layers_str}\nYou can query or modify these layers in generated scripts."
+
                 messages = [{"role": "system", "content": sys_prompt}]
                 for msg in st.session_state["chat_history"][current_agent_key]:
                     if msg["role"] == "user":
@@ -413,6 +675,162 @@ if user_input:
             speak(response_text, voice_key=agent_info["voice"])
             
         st.rerun()
+
+with tab2:
+    st.title("🌊 GLOF & Dam Breach Simulator")
+    st.markdown(
+        "Evaluate GLOF hazards, estimate moraine/dam breach parameters, trigger unsteady hydraulic simulations, "
+        "and generate DEM derivatives per CWC 2024 and NDMA 2020 guidelines."
+    )
+    st.divider()
+
+    # SECTION 1: Breach Parameter Calculator
+    st.subheader("🧮 Dam / Moraine Breach Parameter Calculator")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        V_w = st.number_input("Glacial Lake Volume (million m³)", min_value=0.01, max_value=500.0, value=5.0, step=0.5)
+        h_b = st.number_input("Dam/Moraine Height (meters)", min_value=1.0, max_value=200.0, value=25.0, step=1.0)
+    with col2:
+        failure_mode = st.selectbox("Failure Mode", ["Overtopping", "Piping"])
+        
+    # Calculate
+    V_w_m3 = V_w * 1e6
+    K_o = 1.3 if failure_mode == "Overtopping" else 1.0
+    g = 9.81
+    
+    # 1. Froehlich (2008)
+    B_avg_f08 = 0.27 * K_o * (V_w_m3 ** 0.32) * (h_b ** 0.04)
+    t_f_f08_sec = 63.2 * ((V_w_m3 / (g * (h_b ** 2))) ** 0.5)
+    t_f_f08_hr = t_f_f08_sec / 3600.0
+    Q_p_f08 = 0.607 * (V_w_m3 ** 0.295) * (h_b ** 1.24)
+    
+    # 2. MacDonald & Langridge-Monopolis (1984)
+    V_er = 0.023 * ((V_w_m3 * h_b) ** 0.28)
+    t_d_ml = 0.0179 * (V_er ** 0.36)
+    B_avg_ml = V_er / (h_b * (h_b * 1.5))
+    Q_p_ml = 1.154 * ((V_w_m3 * h_b) ** 0.412)
+    
+    # 3. Von Thun & Gillette (1990)
+    B_avg_vt = 2.5 * h_b + (15.0 if failure_mode == "Overtopping" else 0)
+    t_f_vt = 0.015 * h_b + (0.15 if failure_mode == "Overtopping" else 0)
+    Q_p_vt = 8.0 * (g ** 0.5) * (B_avg_vt ** 1.5)
+    
+    # Comparison Dataframe
+    calc_data = {
+        "Breach Parameter": [
+            "Average Breach Width (B_avg, m)", 
+            "Breach Formation Time (t_f, hours)", 
+            "Estimated Peak Outflow (Q_p, m³/s)"
+        ],
+        "Froehlich (2008)": [f"{B_avg_f08:.1f} m", f"{t_f_f08_hr:.2f} hrs ({t_f_f08_sec/60:.1f} mins)", f"{Q_p_f08:.1f} m³/s"],
+        "MacDonald & L-M (1984)": [f"{B_avg_ml:.1f} m", f"{t_d_ml:.2f} hrs ({t_d_ml*60:.1f} mins)", f"{Q_p_ml:.1f} m³/s"],
+        "Von Thun & Gillette (1990)": [f"{B_avg_vt:.1f} m", f"{t_f_vt:.2f} hrs ({t_f_vt*60:.1f} mins)", f"{Q_p_vt:.1f} m³/s"]
+    }
+    
+    st.table(calc_data)
+    
+    # SECTION 2: HEC-RAS Simulation Controller
+    st.divider()
+    st.subheader("🌊 HEC-RAS COM Controller")
+    
+    prj_files = list(BASE_DIR.glob("**/*.prj"))
+    prj_options = [str(f.relative_to(BASE_DIR)) for f in prj_files]
+    
+    if prj_options:
+        selected_prj = st.selectbox("Select HEC-RAS Project", prj_options)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("▶️ Compute HEC-RAS Unsteady Flow", key="dashboard_run_hecras"):
+                t0 = time.time()
+                os.environ["GIS_AGENT_GUI_APPROVED"] = "True"
+                try:
+                    with st.spinner("⏳ Triggering HEC-RAS computations via COM..."):
+                        from core.cli_bridge import run_hecras_simulation
+                        res = run_hecras_simulation(str(BASE_DIR / selected_prj))
+                    duration = time.time() - t0
+                    st.success(f"Simulation completed in {duration:.1f} seconds!")
+                    st.info(res)
+                finally:
+                    os.environ["GIS_AGENT_GUI_APPROVED"] = "False"
+        with col2:
+            st.caption("Runs HEC-RAS in the background on your PC and returns stdout/stderr directly.")
+    else:
+        st.info("No `.prj` files found in the workspace. Place your HEC-RAS project files inside `workspace/`.")
+
+    # SECTION 3: DEM Product Generator
+    st.divider()
+    st.subheader("🛠️ DEM Products Generator")
+    
+    downloads_dir = BASE_DIR / "downloads"
+    tif_files = list(downloads_dir.glob("**/*.tif")) + list(downloads_dir.glob("**/*.tiff"))
+    tif_options = [str(f.relative_to(BASE_DIR)) for f in tif_files]
+    
+    if tif_options:
+        selected_dem = st.selectbox("Select Elevation DEM Raster (.tif)", tif_options)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            make_slope = st.checkbox("Generate Slope Map", value=True)
+            make_aspect = st.checkbox("Generate Aspect Map", value=True)
+        with col2:
+            make_hillshade = st.checkbox("Generate Hillshade Map", value=True)
+            contour_int = st.number_input("Contour Interval (meters)", min_value=5, max_value=200, value=50, step=5)
+            make_contours = st.checkbox("Generate Contour Lines (.shp)", value=False)
+            
+        if st.button("🛠️ Generate DEM Products", key="dashboard_gen_dem"):
+            t0 = time.time()
+            with st.spinner("⏳ Processing DEM derivatives via GDAL..."):
+                dem_fullpath = BASE_DIR / selected_dem
+                out_dir = downloads_dir
+                
+                results_log = []
+                try:
+                    # 1. Slope
+                    if make_slope:
+                        slope_path = out_dir / f"{dem_fullpath.stem}_slope.tif"
+                        subprocess.run(f'gdaldem slope "{dem_fullpath}" "{slope_path}" -compute_edges', shell=True, check=True)
+                        results_log.append(f"Slope map generated: `workspace/downloads/{slope_path.name}`")
+                    # 2. Aspect
+                    if make_aspect:
+                        aspect_path = out_dir / f"{dem_fullpath.stem}_aspect.tif"
+                        subprocess.run(f'gdaldem aspect "{dem_fullpath}" "{aspect_path}" -compute_edges', shell=True, check=True)
+                        results_log.append(f"Aspect map generated: `workspace/downloads/{aspect_path.name}`")
+                    # 3. Hillshade
+                    if make_hillshade:
+                        hillshade_path = out_dir / f"{dem_fullpath.stem}_hillshade.tif"
+                        subprocess.run(f'gdaldem hillshade "{dem_fullpath}" "{hillshade_path}" -compute_edges', shell=True, check=True)
+                        results_log.append(f"Hillshade map generated: `workspace/downloads/{hillshade_path.name}`")
+                    # 4. Contours
+                    if make_contours:
+                        contours_path = out_dir / f"{dem_fullpath.stem}_contours.shp"
+                        subprocess.run(f'gdal_contour -a elev -i {contour_int} "{dem_fullpath}" "{contours_path}"', shell=True, check=True)
+                        results_log.append(f"Contours generated: `workspace/downloads/{contours_path.name}`")
+                        
+                    duration = time.time() - t0
+                    st.success(f"Successfully processed derivatives in {duration:.1f}s!")
+                    for log in results_log:
+                        st.info(log)
+                except Exception as e:
+                    st.error(f"Failed to generate products: {e}")
+    else:
+        st.info("No `.tif` or `.tiff` files found in `workspace/downloads/`.")
+
+    # SECTION 4: ANUGA / Debris Flow Multi-Phase Reference
+    st.divider()
+    st.subheader("🏔️ Multi-Phase Debris Flow Guidance (CWC/NDMA)")
+    st.markdown(
+        "CWC Guidelines require coupling **debris flow modeling** (such as **r.avaflow** or **ANUGA**) with **HEC-RAS** downstream."
+    )
+    st.code(
+        "# Coupled Workflow Recommendation:\n"
+        "1. Simulate the landslide / glacier avalanche trigger in r.avaflow (or ANUGA Debris flow solver).\n"
+        "2. Export the discharge hydrograph at the lake outlet.\n"
+        "3. Import this hydrograph as a Boundary Condition (Lateral Inflow Hydrograph) in HEC-RAS 2D.\n"
+        "4. Compute HEC-RAS 2D to map downstream flood arrival times and velocities.",
+        language="python"
+    )
 
 st.markdown("---")
 with st.expander("📁 Workspace Files"):
